@@ -12,6 +12,9 @@ const HISTORY_TTL = 24 * 60 * 60;
 const HISTORY_TURNS = 8;
 const LOCK_TTL = 45;
 const MAX_PROMPT_CHARS = 8_000;
+const MAX_MEMORY_CHATS = 500;
+const RATE_LIMIT_WINDOW = 60_000; // 1 minute
+const RATE_LIMIT_MAX = 10; // max AI requests per user per window
 
 // ── Types ────────────────────────────────────────────
 
@@ -26,7 +29,7 @@ interface TGMessage {
   entities?: TGEntity[];
   reply_to_message?: { from?: TGUser };
 }
-interface TGUpdate { update_id: number; message?: TGMessage; }
+interface TGUpdate { update_id: number; message?: TGMessage; edited_message?: TGMessage; }
 interface BotTurn { user: string; assistant: string; }
 
 // ── Helpers ──────────────────────────────────────────
@@ -62,6 +65,20 @@ function sanitizePrompt(text: string, botUsername: string): string {
 function historyKey(chatId: number) { return `manticode:history:${chatId}`; }
 function lockKey(chatId: number) { return `manticode:lock:${chatId}`; }
 
+// ── Rate limiting ───────────────────────────────────
+
+const rateLimitMap = new Map<number, number[]>(); // userId → timestamps
+
+function isRateLimited(userId: number): boolean {
+  const now = Date.now();
+  const timestamps = rateLimitMap.get(userId) || [];
+  const recent = timestamps.filter((t) => now - t < RATE_LIMIT_WINDOW);
+  rateLimitMap.set(userId, recent);
+  if (recent.length >= RATE_LIMIT_MAX) return true;
+  recent.push(now);
+  return false;
+}
+
 async function loadHistory(redis: Redis | null, memoryHistory: Map<number, BotTurn[]>, chatId: number): Promise<BotTurn[]> {
   if (redis) {
     try {
@@ -81,6 +98,11 @@ async function saveHistory(redis: Redis | null, memoryHistory: Map<number, BotTu
       await redis.set(historyKey(chatId), JSON.stringify(trimmed), "EX", HISTORY_TTL);
       return;
     } catch { /* fall through to memory */ }
+  }
+  // Evict oldest entries when memory map exceeds cap
+  if (memoryHistory.size >= MAX_MEMORY_CHATS && !memoryHistory.has(chatId)) {
+    const oldest = memoryHistory.keys().next().value!;
+    memoryHistory.delete(oldest);
   }
   memoryHistory.set(chatId, trimmed);
 }
@@ -173,11 +195,21 @@ async function handleMessage(
     prompt = msg.text.slice(commandToken.length).trim();
   } else if (msg.chat.type === "group" || msg.chat.type === "supergroup") {
     if (!shouldRespondInGroup(msg, botUsername)) return;
-    prompt = sanitizePrompt(prompt, botUsername);
   }
 
-  if (!prompt.trim()) {
-    await sendText(chatId, "Give me something to work with — send a prompt after `/ask` or mention me with a question.", { replyToMessageId: msgId });
+  prompt = sanitizePrompt(prompt, botUsername);
+
+  if (!prompt) {
+    const hint = cmd === "/ask"
+      ? "Send a question after the command, e.g. `/ask how do I parse JSON in Go?`"
+      : "Give me something to work with — send a prompt or mention me with a question.";
+    await sendText(chatId, hint, { replyToMessageId: msgId });
+    return;
+  }
+
+  // ── Rate limit check
+  if (msg.from && isRateLimited(msg.from.id)) {
+    await sendText(chatId, "You're sending requests too fast — wait a minute and try again.", { replyToMessageId: msgId });
     return;
   }
 
@@ -185,19 +217,28 @@ async function handleMessage(
   const result = await withLock(redis, chatId, async () => {
     await telegramApi("sendChatAction", { chat_id: chatId, action: "typing" });
 
-    const history = await loadHistory(redis, memoryHistory, chatId);
-    const messages = buildMessages(history, prompt);
+    // Re-send typing indicator every 4s (Telegram expires it after ~5s)
+    const typingInterval = setInterval(() => {
+      telegramApi("sendChatAction", { chat_id: chatId, action: "typing" }).catch(() => {});
+    }, 4_000);
 
-    let reply: string;
     try {
-      reply = await generateReply(messages);
-    } catch (err) {
-      reply = `Error generating response: ${(err as Error).message}`;
-    }
+      const history = await loadHistory(redis, memoryHistory, chatId);
+      const messages = buildMessages(history, prompt);
 
-    reply = reply.trim() || "I couldn't generate a response for that.";
-    await sendText(chatId, reply, { replyToMessageId: msgId });
-    await saveHistory(redis, memoryHistory, chatId, [...history, { user: prompt, assistant: reply }]);
+      let reply: string;
+      try {
+        reply = await generateReply(messages);
+      } catch (err) {
+        reply = `Error generating response: ${(err as Error).message}`;
+      }
+
+      reply = reply.trim() || "I couldn't generate a response for that.";
+      await sendText(chatId, reply, { replyToMessageId: msgId });
+      await saveHistory(redis, memoryHistory, chatId, [...history, { user: prompt, assistant: reply }]);
+    } finally {
+      clearInterval(typingInterval);
+    }
   });
 
   if (result === null) {
@@ -280,20 +321,21 @@ export async function startBot(): Promise<{ stop: () => Promise<void> }> {
         const updates = await telegramApi<TGUpdate[]>("getUpdates", {
           timeout: POLL_TIMEOUT,
           offset,
-          allowed_updates: ["message"],
+          allowed_updates: ["message", "edited_message"],
         });
 
         for (const update of updates) {
           offset = update.update_id + 1;
-          if (!update.message) continue;
+          const msg = update.message || update.edited_message;
+          if (!msg) continue;
           try {
-            await handleMessage(redis, memoryHistory, update.message, botUsername);
+            await handleMessage(redis, memoryHistory, msg, botUsername);
           } catch (err) {
             console.error("Message handling error:", err);
             try {
-              await sendText(update.message.chat.id,
+              await sendText(msg.chat.id,
                 "Something went wrong processing that request.",
-                { replyToMessageId: update.message.message_id },
+                { replyToMessageId: msg.message_id },
               );
             } catch { /* double fault, ignore */ }
           }

@@ -47,6 +47,28 @@ function splitMessage(text: string): string[] {
   return chunks;
 }
 
+async function sendChunk(
+  chatId: number,
+  text: string,
+  extra: Record<string, unknown>,
+): Promise<void> {
+  try {
+    await telegramApi("sendMessage", {
+      chat_id: chatId,
+      text,
+      parse_mode: "Markdown",
+      ...extra,
+    });
+  } catch {
+    // Markdown parse failure — retry as plain text
+    await telegramApi("sendMessage", {
+      chat_id: chatId,
+      text,
+      ...extra,
+    });
+  }
+}
+
 export async function sendText(
   chatId: number,
   text: string,
@@ -54,10 +76,7 @@ export async function sendText(
 ): Promise<void> {
   const chunks = splitMessage(text);
   for (let i = 0; i < chunks.length; i++) {
-    await telegramApi("sendMessage", {
-      chat_id: chatId,
-      text: chunks[i],
-      parse_mode: "Markdown",
+    await sendChunk(chatId, chunks[i], {
       reply_to_message_id: i === 0 ? options.replyToMessageId : undefined,
       allow_sending_without_reply: true,
       reply_markup: i === 0 ? options.replyMarkup : undefined,
