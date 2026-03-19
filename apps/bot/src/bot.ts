@@ -6,7 +6,7 @@ import { buildMessages, generateReply } from "./ai.js";
 
 const MINIAPP_URL = process.env.TELEGRAM_MINIAPP_URL || "";
 const GROUP_MODE = (process.env.TELEGRAM_BOT_GROUP_MODE || "mention").toLowerCase() as "mention" | "all";
-const POLL_TIMEOUT = 30;
+const POLL_TIMEOUT = 5;
 const RETRY_DELAY = 2_000;
 const HISTORY_TTL = 24 * 60 * 60;
 const HISTORY_TURNS = 8;

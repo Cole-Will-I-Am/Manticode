@@ -1,3 +1,4 @@
+import "./proxy-setup.js";
 import { startBot } from "./bot.js";
 
 async function main() {
@@ -11,6 +12,9 @@ async function main() {
 
   process.on("SIGINT", () => shutdown("SIGINT"));
   process.on("SIGTERM", () => shutdown("SIGTERM"));
+
+  // Keep the process alive — the polling loop runs in the background
+  await new Promise(() => {});
 }
 
 main().catch((err) => {

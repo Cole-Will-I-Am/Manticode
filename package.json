@@ -5,6 +5,8 @@
   "scripts": {
     "dev": "turbo dev",
     "build": "turbo build",
+    "build:web": "cd apps/web && npx next build",
+    "deploy:site": "pnpm build:web && cp -r apps/web/out/* apps/landing/public/ && cd apps/landing && npx wrangler deploy",
     "deploy:landing": "cd apps/landing && npx wrangler deploy",
     "deploy:api": "cd apps/api && npx wrangler deploy",
     "lint": "turbo lint",
