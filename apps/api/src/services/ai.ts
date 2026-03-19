@@ -1,11 +1,16 @@
 /**
- * AI provider service — supports OpenAI and Anthropic streaming.
+ * AI provider service — supports Ollama Cloud, OpenAI, and Anthropic streaming.
  *
  * Yields ChatChunk objects compatible with the SSE message route.
  */
 
-const PROVIDER = (process.env.AI_PROVIDER || "anthropic").toLowerCase();
+const PROVIDER = (process.env.AI_PROVIDER || "ollama").toLowerCase();
 const TIMEOUT_MS = 120_000;
+
+// Ollama Cloud (OpenAI-compatible API)
+const OLLAMA_KEY = process.env.OLLAMA_API_KEY || "";
+const OLLAMA_BASE = process.env.OLLAMA_BASE_URL || "https://ollama.com/v1";
+const OLLAMA_MODEL = process.env.OLLAMA_MODEL || "nemotron-3-super";
 
 // OpenAI
 const OPENAI_KEY = process.env.OPENAI_API_KEY || "";
@@ -28,6 +33,72 @@ export interface ChatChunk {
   done: boolean;
   promptTokens?: number;
   completionTokens?: number;
+}
+
+// ── Ollama Cloud streaming (OpenAI-compatible) ───────
+
+async function* streamOllama(
+  messages: ChatMessage[],
+  signal?: AbortSignal,
+): AsyncGenerator<ChatChunk> {
+  const res = await fetch(`${OLLAMA_BASE}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${OLLAMA_KEY}`,
+    },
+    body: JSON.stringify({
+      model: OLLAMA_MODEL,
+      messages,
+      stream: true,
+    }),
+    signal: signal ?? AbortSignal.timeout(TIMEOUT_MS),
+  });
+
+  if (!res.ok || !res.body) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Ollama Cloud ${res.status}: ${text}`);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let promptTokens = 0;
+  let completionTokens = 0;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("data: ")) continue;
+      const payload = trimmed.slice(6);
+      if (payload === "[DONE]") {
+        yield { model: OLLAMA_MODEL, content: "", done: true, promptTokens, completionTokens };
+        return;
+      }
+      try {
+        const parsed = JSON.parse(payload);
+        if (parsed.usage) {
+          promptTokens = parsed.usage.prompt_tokens ?? 0;
+          completionTokens = parsed.usage.completion_tokens ?? 0;
+        }
+        const delta = parsed.choices?.[0]?.delta?.content || "";
+        if (delta) {
+          yield { model: OLLAMA_MODEL, content: delta, done: false };
+        }
+      } catch {
+        // skip malformed
+      }
+    }
+  }
+
+  yield { model: OLLAMA_MODEL, content: "", done: true, promptTokens, completionTokens };
 }
 
 // ── OpenAI streaming ─────────────────────────────────
@@ -201,11 +272,15 @@ export async function* streamChat(
 ): AsyncGenerator<ChatChunk> {
   if (PROVIDER === "anthropic") {
     yield* streamAnthropic(messages, signal);
-  } else {
+  } else if (PROVIDER === "openai") {
     yield* streamOpenAI(messages, signal);
+  } else {
+    yield* streamOllama(messages, signal);
   }
 }
 
 export function getModelName(): string {
-  return PROVIDER === "anthropic" ? ANTHROPIC_MODEL : OPENAI_MODEL;
+  if (PROVIDER === "anthropic") return ANTHROPIC_MODEL;
+  if (PROVIDER === "openai") return OPENAI_MODEL;
+  return OLLAMA_MODEL;
 }
