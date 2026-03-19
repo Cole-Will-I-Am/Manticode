@@ -1,0 +1,17 @@
+{
+  "name": "manticode",
+  "private": true,
+  "packageManager": "pnpm@9.15.0",
+  "scripts": {
+    "dev": "turbo dev",
+    "build": "turbo build",
+    "deploy:landing": "cd apps/landing && npx wrangler deploy",
+    "deploy:api": "cd apps/api && npx wrangler deploy",
+    "lint": "turbo lint",
+    "clean": "turbo clean"
+  },
+  "devDependencies": {
+    "turbo": "^2.3.0",
+    "typescript": "^5.7.0"
+  }
+}

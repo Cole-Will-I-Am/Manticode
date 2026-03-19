@@ -1,0 +1,15 @@
+name = "manticode-landing"
+main = "src/index.js"
+compatibility_date = "2026-03-01"
+
+[assets]
+directory = "./public"
+binding = "ASSETS"
+
+[[routes]]
+pattern = "manticthink.com/*"
+zone_name = "manticthink.com"
+
+[[routes]]
+pattern = "www.manticthink.com/*"
+zone_name = "manticthink.com"
