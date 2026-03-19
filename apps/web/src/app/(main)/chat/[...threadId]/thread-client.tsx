@@ -6,8 +6,9 @@ import { ChatPanel } from "@/components/chat/chat-panel";
 import { useChatStore } from "@/stores/chat";
 import { useDrawer } from "@/components/layout/app-shell";
 
-export default function ThreadPage() {
-  const { threadId } = useParams<{ threadId: string }>();
+export default function ThreadClient() {
+  const params = useParams<{ threadId: string[] }>();
+  const threadId = params.threadId?.[0];
   const { fetchMessages, setActiveThread, threads } = useChatStore();
   const { toggle } = useDrawer();
 

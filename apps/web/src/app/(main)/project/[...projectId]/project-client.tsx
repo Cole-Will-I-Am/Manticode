@@ -6,8 +6,9 @@ import { useWorkspaceStore } from "@/stores/workspace";
 import { useDrawer } from "@/components/layout/app-shell";
 import { cn } from "@/lib/cn";
 
-export default function ProjectPage() {
-  const { projectId } = useParams<{ projectId: string }>();
+export default function ProjectClient() {
+  const params = useParams<{ projectId: string[] }>();
+  const projectId = params.projectId?.[0];
   const { files, activeFile, fetchFiles, setActiveFile } = useWorkspaceStore();
   const { toggle } = useDrawer();
 
