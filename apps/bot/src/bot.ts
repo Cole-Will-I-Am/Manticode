@@ -57,31 +57,43 @@ function sanitizePrompt(text: string, botUsername: string): string {
   return text.replace(new RegExp(`@${botUsername}\\b`, "gi"), "").trim().slice(0, MAX_PROMPT_CHARS);
 }
 
-// ── Redis history ────────────────────────────────────
+// ── History (Redis with in-memory fallback) ──────────
 
 function historyKey(chatId: number) { return `manticode:history:${chatId}`; }
 function lockKey(chatId: number) { return `manticode:lock:${chatId}`; }
 
-async function loadHistory(redis: Redis, chatId: number): Promise<BotTurn[]> {
-  try {
-    const raw = await redis.get(historyKey(chatId));
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch { return []; }
+async function loadHistory(redis: Redis | null, memoryHistory: Map<number, BotTurn[]>, chatId: number): Promise<BotTurn[]> {
+  if (redis) {
+    try {
+      const raw = await redis.get(historyKey(chatId));
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch { /* fall through to memory */ }
+  }
+  return memoryHistory.get(chatId) || [];
 }
 
-async function saveHistory(redis: Redis, chatId: number, turns: BotTurn[]): Promise<void> {
-  try {
-    await redis.set(historyKey(chatId), JSON.stringify(turns.slice(-HISTORY_TURNS)), "EX", HISTORY_TTL);
-  } catch { /* non-fatal */ }
+async function saveHistory(redis: Redis | null, memoryHistory: Map<number, BotTurn[]>, chatId: number, turns: BotTurn[]): Promise<void> {
+  const trimmed = turns.slice(-HISTORY_TURNS);
+  if (redis) {
+    try {
+      await redis.set(historyKey(chatId), JSON.stringify(trimmed), "EX", HISTORY_TTL);
+      return;
+    } catch { /* fall through to memory */ }
+  }
+  memoryHistory.set(chatId, trimmed);
 }
 
-async function clearHistory(redis: Redis, chatId: number): Promise<void> {
-  await redis.del(historyKey(chatId));
+async function clearHistory(redis: Redis | null, memoryHistory: Map<number, BotTurn[]>, chatId: number): Promise<void> {
+  if (redis) {
+    try { await redis.del(historyKey(chatId)); } catch { /* ignore */ }
+  }
+  memoryHistory.delete(chatId);
 }
 
-async function withLock<T>(redis: Redis, chatId: number, fn: () => Promise<T>): Promise<T | null> {
+async function withLock<T>(redis: Redis | null, chatId: number, fn: () => Promise<T>): Promise<T | null> {
+  if (!redis) return fn(); // No lock without Redis — just run it
   const acquired = await redis.set(lockKey(chatId), "1", "EX", LOCK_TTL, "NX");
   if (!acquired) return null;
   try { return await fn(); }
@@ -101,7 +113,8 @@ function startMarkup() {
 }
 
 async function handleMessage(
-  redis: Redis,
+  redis: Redis | null,
+  memoryHistory: Map<number, BotTurn[]>,
   msg: TGMessage,
   botUsername: string,
 ): Promise<void> {
@@ -144,7 +157,7 @@ async function handleMessage(
 
   // ── /reset
   if (cmd === "/reset" || cmd === "/clear") {
-    await clearHistory(redis, chatId);
+    await clearHistory(redis, memoryHistory, chatId);
     await sendText(chatId,
       "Context cleared. Next message starts a fresh conversation.",
       { replyToMessageId: msgId },
@@ -172,7 +185,7 @@ async function handleMessage(
   const result = await withLock(redis, chatId, async () => {
     await telegramApi("sendChatAction", { chat_id: chatId, action: "typing" });
 
-    const history = await loadHistory(redis, chatId);
+    const history = await loadHistory(redis, memoryHistory, chatId);
     const messages = buildMessages(history, prompt);
 
     let reply: string;
@@ -184,7 +197,7 @@ async function handleMessage(
 
     reply = reply.trim() || "I couldn't generate a response for that.";
     await sendText(chatId, reply, { replyToMessageId: msgId });
-    await saveHistory(redis, chatId, [...history, { user: prompt, assistant: reply }]);
+    await saveHistory(redis, memoryHistory, chatId, [...history, { user: prompt, assistant: reply }]);
   });
 
   if (result === null) {
@@ -204,11 +217,22 @@ export async function startBot(): Promise<{ stop: () => Promise<void> }> {
     return { stop: async () => {} };
   }
 
-  const redis = new Redis(process.env.REDIS_URL || "redis://localhost:6379", {
-    maxRetriesPerRequest: 3,
-    lazyConnect: true,
-  });
-  await redis.connect();
+  let redis: Redis | null = null;
+  try {
+    redis = new Redis(process.env.REDIS_URL || "redis://localhost:6379", {
+      maxRetriesPerRequest: 3,
+      lazyConnect: true,
+      retryStrategy: (times) => (times > 3 ? null : Math.min(times * 200, 2000)),
+    });
+    await redis.connect();
+    console.log("Redis connected");
+  } catch (err) {
+    console.warn("Redis unavailable — running without conversation history:", (err as Error).message);
+    redis = null;
+  }
+
+  // In-memory history fallback when Redis is down
+  const memoryHistory = new Map<number, BotTurn[]>();
 
   const me = await telegramApi<TGUser>("getMe");
   const botUsername = me.username || "manticode_bot";
@@ -263,7 +287,7 @@ export async function startBot(): Promise<{ stop: () => Promise<void> }> {
           offset = update.update_id + 1;
           if (!update.message) continue;
           try {
-            await handleMessage(redis, update.message, botUsername);
+            await handleMessage(redis, memoryHistory, update.message, botUsername);
           } catch (err) {
             console.error("Message handling error:", err);
             try {
@@ -286,7 +310,7 @@ export async function startBot(): Promise<{ stop: () => Promise<void> }> {
     stop: async () => {
       stopped = true;
       await loop.catch(() => {});
-      await redis.disconnect();
+      if (redis) await redis.disconnect();
       console.log("Manticode bot stopped");
     },
   };
